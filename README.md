@@ -11,6 +11,103 @@ make && ./test_neon_write
 
 ---
 
+## 零、一句话总结写入流程
+
+**攒批 → commit → put_batch → 追加写入 EphemeralFile。**
+
+下面是严格对照源码验证后的详细展开。
+
+### 0.1 三阶段写入
+
+```
+阶段一: WAL 解码（在 WAL 到达 Pageserver 之前/之时）
+   WAL 原始字节 → 解码为 InterpretedWalRecord
+   其中数据页面部分在解码时就已经 bincode 序列化好了，
+   存入 interpreted.batch: SerializedValueBatch
+   （见 wal_decoder/src/serialized_batch.rs:235: val.ser_into(&mut record.batch.raw)）
+
+阶段二: 攒批（ingest 循环，walreceiver_connection.rs:434-480）
+   for interpreted in records:
+       ingest_record(interpreted, modification)
+           ├─ modification.set_lsn(lsn)               // 推进 LSN
+           ├─ 处理元数据 → modification.put(key, val)   // 攒入 pending_metadata_pages
+           └─ modification.ingest_batch(interpreted.batch)  // 攒入 pending_data_batch
+       uncommitted++
+
+   ⚠️ 此时数据还在 DatadirModification 的内存变量里，没有写入 InMemoryLayer。
+
+阶段三: 提交（达到阈值时触发 commit）
+   触发条件（walreceiver_connection.rs:475-477）:
+     uncommitted >= ingest_batch_size (默认 100 条)
+     或 pending 字节数 > MAX_PENDING_BYTES (8MB)
+
+   commit() 内部（pgdatadir_mapping.rs:2867-2948）:
+     ① 合并 pending_metadata + pending_data → 一个 SerializedValueBatch
+     ② writer.put_batch(batch)        →  一次性写入 InMemoryLayer
+     ③ writer.finish_write(lsn)       →  推进 last_record_lsn
+```
+
+### 0.2 put_batch 内部：一次 I/O + 逐条更新索引
+
+```
+writer.put_batch(batch)                          // timeline.rs:7880
+  │
+  ├─ get_open_layer_action()                     // 判断: Open / Roll / None
+  │     没有 layer → Open（创建新 InMemoryLayer）
+  │     大小超过 checkpoint_distance → Roll（冻结旧的 + 创建新的）
+  │     否则 → None（继续用当前 layer）
+  │
+  └─ layer.put_batch(batch)                      // inmemory_layer.rs:571
+       │
+       ├─ base_offset = file.len()               // 记录写入前文件大小
+       │
+       ├─ file.write_raw(&batch.raw)             // ★ 一次 I/O：整个 batch 的 raw 字节追加写入
+       │     不是逐条写入，而是把 N 条记录拼好的字节一把写进去
+       │
+       └─ for meta in batch.metadata:            // 逐条更新内存索引
+             entry = IndexEntry { pos = base_offset + meta.batch_offset, len, will_init }
+             index[meta.key].append_or_update_last(meta.lsn, entry)
+```
+
+### 0.3 数据在各阶段的形态
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段一: WAL 解码                                                            │
+│   Value::Image(8KB 页面) 或 Value::WalRecord(WAL 增量)                      │
+│       ↓ val.ser_into(&mut raw)   ← bincode 大端序列化                       │
+│   SerializedValueBatch { raw: Vec<u8>, metadata: [...] }                    │
+│   ⚠️ 数据页面此时已经序列化好了（"pre-serialized batch", models.rs:79 注释）   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 阶段二: 攒批                                                                │
+│   DatadirModification:                                                      │
+│     pending_data_batch: Option<SerializedValueBatch>  ← 数据页面（已序列化）  │
+│     pending_metadata_pages: HashMap<Key, Vec<(Lsn, Value)>>  ← 元数据（未序列化）│
+│   ⚠️ 多次 ingest_record 的 batch 通过 extend() 合并到同一个 pending_data_batch │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 阶段三: commit + put_batch                                                  │
+│   ① 元数据走 SerializedValueBatch::from_values() 做 bincode 序列化          │
+│   ② data_batch.extend(metadata_batch) 合并为一个 batch                      │
+│   ③ file.write_raw(&batch.raw)  ← 一次 I/O 写入 EphemeralFile              │
+│   ④ 逐条更新 BTreeMap<CompactKey, VecMap<Lsn, IndexEntry>> 内存索引          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 落盘后: InMemoryLayer 中的数据                                               │
+│   EphemeralFile: [...bincode bytes...]     ← 只追加，不修改                  │
+│   index: { key → [(lsn, {pos, len})] }    ← 内存中的二级索引                 │
+│   读取时: 通过 index 查 (pos, len) → 从 EphemeralFile 读出 → bincode 反序列化 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 0.4 关键数字
+
+| 参数 | 默认值 | 源码位置 | 含义 |
+|------|--------|---------|------|
+| `ingest_batch_size` | **100 条** | `libs/pageserver_api/src/config.rs:688` | 每 100 条 WAL 记录 commit 一次 |
+| `MAX_PENDING_BYTES` | **8 MB** | `pgdatadir_mapping.rs:1733` | pending 字节超过 8MB 也触发 commit |
+| `checkpoint_distance` | **256 MB** | 配置项 | InMemoryLayer 超过此大小触发 roll（冻结+新建）|
+
+---
+
 ## 一、Neon 写入路径全景
 
 ### 1.1 真实的调用链
